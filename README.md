@@ -10,6 +10,11 @@ compose stack:
   speakers** through the mounted PulseAudio/PipeWire socket. The caller just
   POSTs text — no audio handling client-side.
 
+The point is to give tools on **other** machines a voice on this one: a
+headless devbox, a CI runner, an agent on your laptop — anything on the LAN
+POSTs text and it comes out of this computer's speakers. speak-server is
+published on all interfaces for exactly that; see [Security](#security-notes).
+
 Playback is serialized (single-threaded server), so overlapping requests
 queue instead of talking over each other. Errors map to non-2xx so callers
 never believe they spoke when nothing played.
@@ -40,8 +45,15 @@ may resolve to `::1`.
 
 ```sh
 docker compose up -d
+# locally
 curl -sS -X POST --data "Testing." http://127.0.0.1:8899/speak
+# from another machine on the LAN (use this host's address)
+curl -sS -X POST --data "Testing." http://<this-host-ip>:8899/speak
 ```
+
+speak-server binds `8899` on all interfaces by default, so LAN clients can
+reach it out of the box. kokoro (`8880`) stays on loopback — nothing external
+needs it.
 
 The container must run as the desktop user who owns the audio session. This
 defaults to uid/gid 1000; if yours differ (`id -u`), export `UID` and `GID`
@@ -84,10 +96,13 @@ with `speak.sh` to install it.
 
 ## Security notes
 
-There is **no authentication**. The compose file binds both ports to
-loopback (`127.0.0.1`) so only local processes can reach them; if you
-publish them on other interfaces, anyone who can connect can make your
-machine talk (8899) or use your CPU for synthesis (8880).
+speak-server (`8899`) is published on **all interfaces** and has **no
+authentication** — that's deliberate, since the whole point is letting other
+machines speak here. Anyone who can reach the port can make this machine talk.
+Run it on a trusted LAN. If the host is exposed to untrusted networks,
+restrict `8899` with your firewall, or bind it to a specific interface by
+setting the port to `"<lan-ip>:8899:8899"` in `docker-compose.yml`. kokoro
+(`8880`) is loopback-only, so your CPU isn't exposed for synthesis.
 
 The mounted Pulse cookie and socket give the container full access to your
 audio session (including capture, in principle). The mounts are read-only

@@ -2,6 +2,9 @@ services:
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
     container_name: kokoro-tts
+    # Loopback only — kokoro is the internal TTS engine, reached by
+    # speak-server over the compose network. The port is published solely for
+    # local debugging / listing voices; nothing external needs it.
     ports:
       - "127.0.0.1:8880:8880"
     restart: always
@@ -9,8 +12,11 @@ services:
   speak-server:
     build: ./speak-server
     container_name: speak-server
+    # Published on all interfaces so tools on other machines (the whole point)
+    # can POST text and have it spoken here. There is NO auth — run it on a
+    # trusted LAN, or restrict access with your firewall. See README.
     ports:
-      - "127.0.0.1:8899:8899"
+      - "8899:8899"
     # Plays through the host's Pulse/PipeWire session: uid must match the
     # desktop user. UID/GID default to 1000 — export them (or set in .env)
     # if yours differ; PULSE_SERVER below must embed the same uid.
