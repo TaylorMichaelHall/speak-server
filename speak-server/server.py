@@ -6,16 +6,52 @@ instead of talking over each other. Errors map to non-2xx so remote
 callers never believe they spoke when nothing played.
 """
 
+import io
 import json
 import os
 import subprocess
 import urllib.error
 import urllib.request
+import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 KOKORO_URL = os.environ.get("KOKORO_URL", "http://kokoro:8880")
 DEFAULT_VOICE = os.environ.get("VOICE", "af_heart")
 PORT = int(os.environ.get("PORT", "8899"))
+# The audio sink suspends when idle; opening a stream spends the first few
+# hundred ms resuming, which clips the start of speech. Prepend silence so the
+# resume ramp eats that instead of the first syllable. Silent, so it's never
+# heard and never missed. Set to 0 to disable.
+LEAD_SILENCE_MS = int(os.environ.get("LEAD_SILENCE_MS", "500"))
+
+
+def prepend_silence(wav_bytes, ms):
+    """Return a WAV with `ms` of leading silence. Falls back to the original
+    bytes if anything about the WAV can't be parsed — padding is a nicety, so
+    a parse failure must never stop playback."""
+    if ms <= 0:
+        return wav_bytes
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as src:
+            nchannels = src.getnchannels()
+            sampwidth = src.getsampwidth()
+            framerate = src.getframerate()
+            # kokoro returns a streaming WAV whose header carries a placeholder
+            # frame count, so read to EOF rather than trusting getnframes().
+            frames = src.readframes(-1)
+        pad_frames = int(framerate * ms / 1000)
+        silence = b"\x00" * (pad_frames * sampwidth * nchannels)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as dst:
+            # Set format explicitly (not setparams) so the writer sizes the
+            # header from the bytes actually written, not the placeholder count.
+            dst.setnchannels(nchannels)
+            dst.setsampwidth(sampwidth)
+            dst.setframerate(framerate)
+            dst.writeframes(silence + frames)
+        return out.getvalue()
+    except (wave.Error, EOFError, ValueError):
+        return wav_bytes
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -82,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
         if not audio:
             self._reply(502, "kokoro returned empty audio")
             return
+
+        audio = prepend_silence(audio, LEAD_SILENCE_MS)
 
         play = subprocess.run(
             ["paplay", "--client-name=speak-server", "/dev/stdin"],

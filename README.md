@@ -60,7 +60,10 @@ defaults to uid/gid 1000; if yours differ (`id -u`), export `UID` and `GID`
 (or set them in a `.env` file next to the compose file) before `up`. The
 Pulse cookie is mounted from `~/.config/pulse/cookie`.
 
-Env knobs on speak-server: `VOICE` (default `af_heart`), `PORT`, `KOKORO_URL`.
+Env knobs on speak-server: `VOICE` (default `af_heart`), `PORT`, `KOKORO_URL`,
+`LEAD_SILENCE_MS` (default `500`) — silence prepended to each clip so the
+audio sink's resume-from-idle ramp doesn't clip the first syllable; set `0` to
+disable.
 
 ## The mount dance (why the volumes look weird)
 
