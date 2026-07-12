@@ -1,0 +1,38 @@
+services:
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    container_name: kokoro-tts
+    ports:
+      - "127.0.0.1:8880:8880"
+    restart: always
+
+  speak-server:
+    build: ./speak-server
+    container_name: speak-server
+    ports:
+      - "127.0.0.1:8899:8899"
+    # Plays through the host's Pulse/PipeWire session: uid must match the
+    # desktop user. UID/GID default to 1000 — export them (or set in .env)
+    # if yours differ; PULSE_SERVER below must embed the same uid.
+    #
+    # /run/user (not /run/user/<uid>/pulse) is mounted with rslave
+    # propagation because the per-user tmpfs at /run/user/<uid> is only
+    # mounted by logind at login — binding anything under it at boot (this
+    # container autostarts before login) captures a stale placeholder dir.
+    # With rslave, the login-time tmpfs mount propagates into the container.
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      PULSE_SERVER: unix:/run/host-user/${UID:-1000}/pulse/native
+      PULSE_COOKIE: /run/pulse-cookie
+      KOKORO_URL: http://kokoro:8880
+    volumes:
+      - type: bind
+        source: /run/user
+        target: /run/host-user
+        read_only: true
+        bind:
+          propagation: rslave
+      - ~/.config/pulse/cookie:/run/pulse-cookie:ro
+    depends_on:
+      - kokoro
+    restart: always
