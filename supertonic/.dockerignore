@@ -1,0 +1,3 @@
+# The model assets (~400 MB) are bind-mounted at runtime, never baked into
+# the image — keep them out of the build context.
+models/

@@ -1,4 +1,4 @@
-"""Speak server: POST text -> synthesize via kokoro -> play on host speakers.
+"""Speak server: POST text -> synthesize via a TTS engine -> play on host speakers.
 
 Runs in a container with the host's Pulse socket mounted. Playback is
 serialized (single-threaded HTTPServer) so overlapping requests queue
@@ -16,8 +16,20 @@ import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 KOKORO_URL = os.environ.get("KOKORO_URL", "http://kokoro:8880")
+SUPERTONIC_URL = os.environ.get("SUPERTONIC_URL", "http://supertonic:7788")
+DEFAULT_ENGINE = os.environ.get("ENGINE", "kokoro")
 DEFAULT_VOICE = os.environ.get("VOICE", "af_heart")
+SUPERTONIC_VOICE = os.environ.get("SUPERTONIC_VOICE", "M1")
 PORT = int(os.environ.get("PORT", "8899"))
+
+# Both engines speak the OpenAI /v1/audio/speech dialect, so an engine is just
+# a base URL, the model name it insists on, and the voice used when the
+# request doesn't name one (voice names are engine-specific, so a global
+# default would be wrong for one of them).
+ENGINES = {
+    "kokoro": {"url": KOKORO_URL, "model": "kokoro", "voice": DEFAULT_VOICE},
+    "supertonic": {"url": SUPERTONIC_URL, "model": "supertonic-3", "voice": SUPERTONIC_VOICE},
+}
 # The audio sink suspends when idle; opening a stream spends the first few
 # hundred ms resuming, which clips the start of speech. Prepend silence so the
 # resume ramp eats that instead of the first syllable. Silent, so it's never
@@ -77,14 +89,19 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
 
-        # Body is plain text, or JSON {"text": ..., "voice": ..., "speed": ...}
-        text, voice, speed = raw, DEFAULT_VOICE, 1.0
+        # Body is plain text, or JSON
+        # {"text": ..., "engine": ..., "voice": ..., "speed": ..., "lang": ...}
+        text, engine, voice, speed, lang = raw, DEFAULT_ENGINE, None, 1.0, None
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict) and "text" in parsed:
                 text = str(parsed["text"])
-                voice = str(parsed.get("voice", DEFAULT_VOICE))
+                engine = str(parsed.get("engine", DEFAULT_ENGINE))
+                if "voice" in parsed:
+                    voice = str(parsed["voice"])
                 speed = float(parsed.get("speed", 1.0))
+                if "lang" in parsed:
+                    lang = str(parsed["lang"])
         except (ValueError, TypeError):
             pass
 
@@ -92,31 +109,40 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(400, "no text given")
             return
 
+        if engine not in ENGINES:
+            self._reply(400, f"unknown engine {engine!r}; one of: {', '.join(ENGINES)}")
+            return
+        cfg = ENGINES[engine]
+
+        payload = {
+            "model": cfg["model"],
+            "input": text,
+            "voice": voice if voice is not None else cfg["voice"],
+            "response_format": "wav",
+            "speed": speed,
+        }
+        # Supertonic extension ('ko', 'ja', ..., default auto-fallback 'na');
+        # only sent when given so kokoro never sees an unknown field.
+        if lang is not None:
+            payload["lang"] = lang
+
         req = urllib.request.Request(
-            f"{KOKORO_URL}/v1/audio/speech",
-            data=json.dumps(
-                {
-                    "model": "kokoro",
-                    "input": text,
-                    "voice": voice,
-                    "response_format": "wav",
-                    "speed": speed,
-                }
-            ).encode(),
+            f"{cfg['url']}/v1/audio/speech",
+            data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 audio = resp.read()
         except urllib.error.HTTPError as e:
-            self._reply(502, f"kokoro returned HTTP {e.code}: {e.read()[:300].decode(errors='replace')}")
+            self._reply(502, f"{engine} returned HTTP {e.code}: {e.read()[:300].decode(errors='replace')}")
             return
         except (urllib.error.URLError, OSError) as e:
-            self._reply(502, f"kokoro unreachable at {KOKORO_URL}: {e}")
+            self._reply(502, f"{engine} unreachable at {cfg['url']}: {e}")
             return
 
         if not audio:
-            self._reply(502, "kokoro returned empty audio")
+            self._reply(502, f"{engine} returned empty audio")
             return
 
         audio = prepend_silence(audio, LEAD_SILENCE_MS)

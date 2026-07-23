@@ -9,6 +9,24 @@ services:
       - "127.0.0.1:8880:8880"
     restart: always
 
+  supertonic:
+    build: ./supertonic
+    container_name: supertonic-tts
+    # Opt-in: most setups want just one engine, and kokoro is the default.
+    # Enable with COMPOSE_PROFILES=supertonic in .env (see README).
+    profiles: ["supertonic"]
+    # Loopback only, same reasoning as kokoro. Published for local debugging
+    # (e.g. GET /v1/styles); speak-server reaches it over the compose network.
+    ports:
+      - "127.0.0.1:7788:7788"
+    # Model assets live in the repo (git-ignored, ~400 MB) so the stack is
+    # self-contained; the image stays model-free and nothing is fetched at
+    # startup. Read-only: the container must never mutate the checked-out
+    # copy. See README for seeding a fresh clone.
+    volumes:
+      - ${SUPERTONIC_MODEL_DIR:-./supertonic/models/supertonic-3}:/models:ro
+    restart: always
+
   speak-server:
     build: ./speak-server
     container_name: speak-server
@@ -31,6 +49,12 @@ services:
       PULSE_SERVER: unix:/run/host-user/${UID:-1000}/pulse/native
       PULSE_COOKIE: /run/pulse-cookie
       KOKORO_URL: http://kokoro:8880
+      SUPERTONIC_URL: http://supertonic:7788
+      # Engine used when a request doesn't name one, and each engine's
+      # default voice — override in .env.
+      ENGINE: ${ENGINE:-kokoro}
+      VOICE: ${VOICE:-af_heart}
+      SUPERTONIC_VOICE: ${SUPERTONIC_VOICE:-M1}
     volumes:
       - type: bind
         source: /run/user
@@ -39,6 +63,9 @@ services:
         bind:
           propagation: rslave
       - ~/.config/pulse/cookie:/run/pulse-cookie:ro
+    # No depends_on for supertonic: depending on a profile-gated service
+    # would make the default (profile-less) `up` fail. Startup order barely
+    # matters anyway — an engine that isn't up yet just returns a 502.
     depends_on:
       - kokoro
     restart: always
