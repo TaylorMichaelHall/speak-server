@@ -40,7 +40,8 @@ curl -sS -X POST -H 'Content-Type: application/json' \
   http://127.0.0.1:8899/speak
 ```
 
-`engine` is `kokoro` (default) or `supertonic`. When `voice` is omitted, each
+`engine` is `kokoro` (default), `supertonic`, or `random` — see
+[Choosing engines](#choosing-engines). When `voice` is omitted, each
 engine gets its own default (`af_heart` / `M1`) — voice names aren't shared
 between engines, so don't set one without the other.
 
@@ -84,10 +85,15 @@ compose file (copy `.env.example`):
 # .env
 COMPOSE_PROFILES=supertonic   # also run the supertonic container
 ENGINE=supertonic             # engine used when a request doesn't name one
-                              # (default kokoro)
+                              # (kokoro [default], supertonic, or random)
 VOICE=af_heart                # default kokoro voice
 SUPERTONIC_VOICE=M1           # default supertonic voice
 ```
+
+`ENGINE=random` picks an engine per request and falls through to the next
+one if the pick fails, so turning an engine off later costs variety, never
+speech. A request that *names* an engine gets no fallback — the caller asked
+for that one, and a stand-in voice would misreport what happened.
 
 Prefer supertonic? `COMPOSE_PROFILES=supertonic` plus `ENGINE=supertonic`
 makes it the default for every request that doesn't name an engine. kokoro

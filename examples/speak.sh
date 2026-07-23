@@ -2,16 +2,12 @@
 # Speak text aloud via the local speak-server (docker, :8899), which synthesizes
 # through a TTS engine (kokoro or supertonic) and plays on this machine's speakers.
 # Usage: speak.sh "text to say"   |   echo "text" | speak.sh
-# Env: ENGINE (kokoro|supertonic, default kokoro), VOICE (default af_heart /
-#      M1 per engine), SPEAK_HOST (default 127.0.0.1:8899), SPEED (default 1.0)
+# Env: ENGINE (kokoro|supertonic|random), VOICE, SPEAK_HOST (default
+#      127.0.0.1:8899), SPEED (default 1.0). ENGINE and VOICE are only sent
+#      when set — the server's configured defaults apply otherwise, so this
+#      client keeps working whatever engines the server has.
 set -euo pipefail
 
-ENGINE="${ENGINE:-kokoro}"
-# Voice names are engine-specific, so the fallback has to follow the engine.
-case "$ENGINE" in
-  supertonic) VOICE="${VOICE:-M1}" ;;
-  *)          VOICE="${VOICE:-af_heart}" ;;
-esac
 HOST="${SPEAK_HOST:-127.0.0.1:8899}"
 SPEED="${SPEED:-1.0}"
 
@@ -22,8 +18,10 @@ if [ -z "$TEXT" ]; then echo "speak: no text given" >&2; exit 2; fi
 RESP="$(mktemp)"
 trap 'rm -f "$RESP"' EXIT
 
-BODY="$(jq -n --arg t "$TEXT" --arg e "$ENGINE" --arg v "$VOICE" --argjson s "$SPEED" \
-  '{text:$t, engine:$e, voice:$v, speed:$s}')"
+BODY="$(jq -n --arg t "$TEXT" --arg e "${ENGINE:-}" --arg v "${VOICE:-}" --argjson s "$SPEED" \
+  '{text:$t, speed:$s}
+   + (if $e != "" then {engine:$e} else {} end)
+   + (if $v != "" then {voice:$v} else {} end)')"
 
 # The server holds the request until playback finishes, so the timeout covers
 # synthesis + audio duration. curl's -w prints the code (000 on connection

@@ -9,6 +9,7 @@ callers never believe they spoke when nothing played.
 import io
 import json
 import os
+import random
 import subprocess
 import urllib.error
 import urllib.request
@@ -30,6 +31,39 @@ ENGINES = {
     "kokoro": {"url": KOKORO_URL, "model": "kokoro", "voice": DEFAULT_VOICE},
     "supertonic": {"url": SUPERTONIC_URL, "model": "supertonic-3", "voice": SUPERTONIC_VOICE},
 }
+
+
+def synthesize(engine, text, voice, speed, lang):
+    """Ask one engine for WAV audio. Returns (wav_bytes, None) on success,
+    (None, error_string) on failure — no exceptions escape."""
+    cfg = ENGINES[engine]
+    payload = {
+        "model": cfg["model"],
+        "input": text,
+        "voice": voice if voice is not None else cfg["voice"],
+        "response_format": "wav",
+        "speed": speed,
+    }
+    # Supertonic extension ('ko', 'ja', ..., default auto-fallback 'na');
+    # only sent when given so kokoro never sees an unknown field.
+    if lang is not None:
+        payload["lang"] = lang
+
+    req = urllib.request.Request(
+        f"{cfg['url']}/v1/audio/speech",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            audio = resp.read()
+    except urllib.error.HTTPError as e:
+        return None, f"{engine} returned HTTP {e.code}: {e.read()[:300].decode(errors='replace')}"
+    except (urllib.error.URLError, OSError) as e:
+        return None, f"{engine} unreachable at {cfg['url']}: {e}"
+    if not audio:
+        return None, f"{engine} returned empty audio"
+    return audio, None
 # The audio sink suspends when idle; opening a stream spends the first few
 # hundred ms resuming, which clips the start of speech. Prepend silence so the
 # resume ramp eats that instead of the first syllable. Silent, so it's never
@@ -109,40 +143,27 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(400, "no text given")
             return
 
-        if engine not in ENGINES:
-            self._reply(400, f"unknown engine {engine!r}; one of: {', '.join(ENGINES)}")
-            return
-        cfg = ENGINES[engine]
-
-        payload = {
-            "model": cfg["model"],
-            "input": text,
-            "voice": voice if voice is not None else cfg["voice"],
-            "response_format": "wav",
-            "speed": speed,
-        }
-        # Supertonic extension ('ko', 'ja', ..., default auto-fallback 'na');
-        # only sent when given so kokoro never sees an unknown field.
-        if lang is not None:
-            payload["lang"] = lang
-
-        req = urllib.request.Request(
-            f"{cfg['url']}/v1/audio/speech",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                audio = resp.read()
-        except urllib.error.HTTPError as e:
-            self._reply(502, f"{engine} returned HTTP {e.code}: {e.read()[:300].decode(errors='replace')}")
-            return
-        except (urllib.error.URLError, OSError) as e:
-            self._reply(502, f"{engine} unreachable at {cfg['url']}: {e}")
+        # 'random' shuffles all engines and falls through to the next on
+        # failure, so a knocked-out engine (e.g. supertonic's profile turned
+        # off) costs variety, never speech. An explicitly named engine gets
+        # no fallback — the caller asked for that one, and a stand-in voice
+        # would misreport what happened.
+        if engine == "random":
+            candidates = random.sample(list(ENGINES), len(ENGINES))
+        elif engine in ENGINES:
+            candidates = [engine]
+        else:
+            self._reply(400, f"unknown engine {engine!r}; one of: {', '.join(ENGINES)}, random")
             return
 
-        if not audio:
-            self._reply(502, f"{engine} returned empty audio")
+        audio, errors = None, []
+        for candidate in candidates:
+            audio, err = synthesize(candidate, text, voice, speed, lang)
+            if audio is not None:
+                break
+            errors.append(err)
+        if audio is None:
+            self._reply(502, "; ".join(errors))
             return
 
         audio = prepend_silence(audio, LEAD_SILENCE_MS)
