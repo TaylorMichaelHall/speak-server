@@ -1,2 +1,6 @@
 # Local env for UID/GID or other machine-specific interpolation
 .env
+
+# Supertonic model assets (~400 MB) — bind-mounted into the container, too
+# large for git. See README for seeding.
+supertonic/models/
