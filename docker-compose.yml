@@ -2,11 +2,10 @@ services:
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
     container_name: kokoro-tts
-    # Loopback only — kokoro is the internal TTS engine, reached by
-    # speak-server over the compose network. The port is published solely for
-    # local debugging / listing voices; nothing external needs it.
-    ports:
-      - "127.0.0.1:8880:8880"
+    # Internal TTS engine — speak-server reaches it over the compose network.
+    # No host port: the Kokoro image ships a kokoro-only web UI at /web, but
+    # speak-server has its own engine-agnostic dashboard. To list voices or try
+    # that UI temporarily, see README.
     restart: always
 
   supertonic:
@@ -15,10 +14,7 @@ services:
     # Opt-in: most setups want just one engine, and kokoro is the default.
     # Enable with COMPOSE_PROFILES=supertonic in .env (see README).
     profiles: ["supertonic"]
-    # Loopback only, same reasoning as kokoro. Published for local debugging
-    # (e.g. GET /v1/styles); speak-server reaches it over the compose network.
-    ports:
-      - "127.0.0.1:7788:7788"
+    # Internal TTS engine — speak-server reaches it over the compose network.
     # Model assets live in the repo (git-ignored, ~400 MB) so the stack is
     # self-contained; the image stays model-free and nothing is fetched at
     # startup. Read-only: the container must never mutate the checked-out
@@ -31,10 +27,10 @@ services:
     build: ./speak-server
     container_name: speak-server
     # Published on all interfaces so tools on other machines (the whole point)
-    # can POST text and have it spoken here. There is NO auth — run it on a
-    # trusted LAN, or restrict access with your firewall. See README.
+    # can POST text and have it spoken here. Authentication is off until you set
+    # SPEAK_TOKENS — until then, treat the port as trusted. See README.
     ports:
-      - "8899:8899"
+      - "${SPEAK_BIND:-0.0.0.0}:8899:8899"
     # Plays through the host's Pulse/PipeWire session: uid must match the
     # desktop user. UID/GID default to 1000 — export them (or set in .env)
     # if yours differ; PULSE_SERVER below must embed the same uid.
@@ -45,16 +41,100 @@ services:
     # container autostarts before login) captures a stale placeholder dir.
     # With rslave, the login-time tmpfs mount propagates into the container.
     user: "${UID:-1000}:${GID:-1000}"
+    # Rootless podman maps container uid 1000 to a *subuid* on the host, which
+    # can't read the 0600 Pulse cookie — set USERNS_MODE=keep-id in .env there
+    # so container 1000 is really you. Empty is the default everywhere else;
+    # don't set it under Docker, which only understands "host".
+    userns_mode: ${USERNS_MODE:-}
+    # SELinux (Fedora/RHEL/CentOS) denies container_t write access to the Pulse
+    # socket, which is labelled user_tmp_t — synthesis succeeds and playback dies
+    # with "Connection refused":
+    #   avc: denied { write } ... comm="paplay" tclass=sock_file
+    # File-level relabelling can't fix it: PipeWire recreates the socket on
+    # restart and the label goes with it. So this container opts out of SELinux
+    # confinement. It already has full access to your audio session by design, so
+    # this widens the blast radius less than it looks — but see the README for a
+    # targeted policy module if you'd rather keep the container confined.
+    # Ignored on hosts without SELinux, and by Docker when it isn't enabled.
+    security_opt:
+      - label=disable
     environment:
       PULSE_SERVER: unix:/run/host-user/${UID:-1000}/pulse/native
       PULSE_COOKIE: /run/pulse-cookie
       KOKORO_URL: http://kokoro:8880
       SUPERTONIC_URL: http://supertonic:7788
-      # Engine used when a request doesn't name one, and each engine's
-      # default voice — override in .env.
+      # Every value below may be left blank: compose always passes the variable,
+      # so the server treats an empty string as "unset" and applies its own
+      # default. That is why nothing here is conditional.
+
+      # --- engines and voices ---
       ENGINE: ${ENGINE:-kokoro}
       VOICE: ${VOICE:-af_heart}
       SUPERTONIC_VOICE: ${SUPERTONIC_VOICE:-M1}
+      SYNTH_TIMEOUT: ${SYNTH_TIMEOUT:-}
+      LATENCY_WINDOW: ${LATENCY_WINDOW:-}
+      ENGINE_FAILURE_THRESHOLD: ${ENGINE_FAILURE_THRESHOLD:-}
+      ENGINE_COOLDOWN: ${ENGINE_COOLDOWN:-}
+
+      # --- priority, queue, interruption ---
+      DEFAULT_PRIORITY: ${DEFAULT_PRIORITY:-}
+      QUEUE_MAX: ${QUEUE_MAX:-}
+      QUEUE_ITEM_TTL: ${QUEUE_ITEM_TTL:-}
+      INTERRUPT: ${INTERRUPT:-}
+      INTERRUPT_MIN_GAP: ${INTERRUPT_MIN_GAP:-}
+      INTERRUPT_REQUEUE: ${INTERRUPT_REQUEUE:-}
+      MAX_TEXT: ${MAX_TEXT:-}
+
+      # --- quiet hours ---
+      QUIET_HOURS: ${QUIET_HOURS:-}
+      # Falls back to TZ, so setting the container timezone once is enough.
+      TZ: ${TZ:-}
+      QUIET_HOURS_TZ: ${QUIET_HOURS_TZ:-}
+      QUIET_HOURS_POLICY: ${QUIET_HOURS_POLICY:-}
+      QUIET_HOURS_OVERRIDE: ${QUIET_HOURS_OVERRIDE:-}
+      QUIET_HOURS_VOLUME: ${QUIET_HOURS_VOLUME:-}
+
+      # --- audio routing and playback ---
+      AUDIO_SINK: ${AUDIO_SINK:-}
+      AUDIO_ROUTES: ${AUDIO_ROUTES:-}
+      VOLUME: ${VOLUME:-}
+      LEAD_SILENCE_MS: ${LEAD_SILENCE_MS:-}
+      PLAY_TIMEOUT: ${PLAY_TIMEOUT:-}
+
+      # --- cache, history, dashboard ---
+      CACHE_ENABLED: ${CACHE_ENABLED:-}
+      CACHE_MAX_MB: ${CACHE_MAX_MB:-}
+      CACHE_MAX_AGE_DAYS: ${CACHE_MAX_AGE_DAYS:-}
+      CACHE_MAX_TEXT: ${CACHE_MAX_TEXT:-}
+      HISTORY_ENABLED: ${HISTORY_ENABLED:-}
+      HISTORY_MAX_ROWS: ${HISTORY_MAX_ROWS:-}
+      HISTORY_MAX_AGE_DAYS: ${HISTORY_MAX_AGE_DAYS:-}
+      HISTORY_KEEP_AUDIO: ${HISTORY_KEEP_AUDIO:-}
+      HISTORY_AUDIO_MAX_MB: ${HISTORY_AUDIO_MAX_MB:-}
+      DASHBOARD: ${DASHBOARD:-}
+
+      # --- authentication and rate limits ---
+      SPEAK_TOKENS: ${SPEAK_TOKENS:-}
+      SPEAK_TOKEN: ${SPEAK_TOKEN:-}
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-}
+      AUTH_EXEMPT_CIDRS: ${AUTH_EXEMPT_CIDRS:-}
+      RATE_LIMIT: ${RATE_LIMIT:-}
+      RATE_LIMIT_EXEMPT_PRIORITY: ${RATE_LIMIT_EXEMPT_PRIORITY:-}
+
+      # --- MQTT bridge, off unless a host is set ---
+      MQTT_HOST: ${MQTT_HOST:-}
+      MQTT_PORT: ${MQTT_PORT:-}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_TLS: ${MQTT_TLS:-}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-}
+      MQTT_TOPIC: ${MQTT_TOPIC:-}
+      MQTT_STATUS_TOPIC: ${MQTT_STATUS_TOPIC:-}
+      MQTT_EVENT_TOPIC: ${MQTT_EVENT_TOPIC:-}
+      MQTT_QOS: ${MQTT_QOS:-}
+
+      WEBHOOKS_FILE: ${WEBHOOKS_FILE:-/data/webhooks.json}
+      LOG_LEVEL: ${LOG_LEVEL:-}
     volumes:
       - type: bind
         source: /run/user
@@ -63,6 +143,16 @@ services:
         bind:
           propagation: rslave
       - ~/.config/pulse/cookie:/run/pulse-cookie:ro
+      # Voice cache, history database, replay clips and webhooks.json. A bind
+      # mount rather than a named volume so it belongs to whoever cloned the
+      # repo — a named volume is created root-owned and the container runs as
+      # your uid, which cannot then write to it. `data/` is git-ignored.
+      #
+      # :Z relabels it for SELinux. Without it, writes are denied outright on
+      # Fedora/RHEL/CentOS hosts and the server quietly falls back to no cache
+      # and no history. Private (:Z, not :z) because only this container uses
+      # the directory; on hosts without SELinux the flag is ignored.
+      - ./data:/data:Z
     # No depends_on for supertonic: depending on a profile-gated service
     # would make the default (profile-less) `up` fail. Startup order barely
     # matters anyway — an engine that isn't up yet just returns a 502.

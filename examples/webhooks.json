@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Copy to data/webhooks.json (or wherever WEBHOOKS_FILE points) and delete",
+    "what you don't want. Each key becomes POST /webhook/<key>. Reload without a",
+    "restart: curl -X POST http://127.0.0.1:8899/api/webhooks/reload",
+    "",
+    "Keys understood in each receiver:",
+    "  preset      github | alertmanager | grafana | uptimekuma | generic",
+    "  template    overrides the preset. {dotted.path} pulls from the payload;",
+    "              {alerts.0.labels.instance} indexes lists. A path that isn't in",
+    "              the payload renders as nothing and its leftover punctuation is",
+    "              tidied away, so one template covers several event types.",
+    "  match       only speak when these paths match; values compare as text, and",
+    "              a list means 'any of these'.",
+    "  secret      required in ?secret= or the X-Webhook-Secret header. Most",
+    "              senders can't set an Authorization header, so this stands in",
+    "              for the normal token. Without it, normal auth applies.",
+    "  priority    emergency | high | normal | low",
+    "  prefix      prepended to the sentence, e.g. 'Heads up:'",
+    "  max_length  truncated at a word boundary (default 300, 0 for no limit)",
+    "  engine, voice, model, speed, lang, sink, volume, wait"
+  ],
+
+  "ci": {
+    "preset": "github",
+    "priority": "low",
+    "secret": "change-me-then-put-it-in-the-github-webhook-url",
+    "match": { "action": ["opened", "closed", "reopened"] }
+  },
+
+  "alerts": {
+    "preset": "alertmanager",
+    "priority": "high",
+    "prefix": "Alert.",
+    "match": { "status": "firing" }
+  },
+
+  "alerts-resolved": {
+    "template": "Resolved: {alerts.0.labels.alertname} on {alerts.0.labels.instance}",
+    "priority": "low",
+    "match": { "status": "resolved" }
+  },
+
+  "uptime": {
+    "preset": "uptimekuma",
+    "priority": "high",
+    "sink": "desk"
+  },
+
+  "doorbell": {
+    "template": "Somebody is at the {location} door.",
+    "priority": "high",
+    "volume": 100,
+    "secret": "change-me"
+  },
+
+  "anything": {
+    "preset": "generic",
+    "priority": "normal",
+    "_comment": "No template: speaks the first of text/message/msg/body/summary/description/title/alert/content/status it finds, or the whole body if that isn't JSON."
+  }
+}

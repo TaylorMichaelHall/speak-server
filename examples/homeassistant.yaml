@@ -1,0 +1,133 @@
+# Home Assistant + speak-server over MQTT.
+#
+# Needs the MQTT integration set up in Home Assistant, and speak-server pointed
+# at the same broker (MQTT_HOST in .env). No HTTP, no token — publishing to a
+# topic is all Home Assistant has to do.
+#
+# Add these to configuration.yaml (or split them into your packages layout).
+
+# ---------------------------------------------------------------------------
+# A notify service, so anything that can notify can now talk.
+# ---------------------------------------------------------------------------
+notify:
+  - name: Speakers
+    platform: mqtt
+    command_topic: speak/say
+
+  # A second service for things that must be heard: emergency priority jumps the
+  # queue, cuts off whatever is talking, and ignores quiet hours.
+  - name: Speakers urgent
+    platform: mqtt
+    command_topic: speak/say/emergency
+
+# ---------------------------------------------------------------------------
+# Sensors from the retained status topic, so the dashboard can show what the
+# machine is doing. speak-server publishes this every 10s and on every change.
+# ---------------------------------------------------------------------------
+mqtt:
+  sensor:
+    - name: Speak queue depth
+      state_topic: speak/status
+      value_template: "{{ value_json.depth }}"
+      unit_of_measurement: items
+
+    - name: Speak now saying
+      state_topic: speak/status
+      # The status payload carries null when nothing is playing.
+      value_template: "{{ value_json.text | default('nothing', true) }}"
+
+  binary_sensor:
+    - name: Speak server online
+      # Retained, and backed by a last will — so this goes off when the container
+      # dies, not just when it is quiet.
+      state_topic: speak/status/online
+      payload_on: "true"
+      payload_off: "false"
+      device_class: connectivity
+
+    - name: Speak muted
+      state_topic: speak/status
+      value_template: "{{ value_json.muted }}"
+      payload_on: "True"
+      payload_off: "False"
+
+  switch:
+    - name: Speak mute
+      command_topic: speak/cmd/mute
+      state_topic: speak/status
+      value_template: "{{ value_json.muted }}"
+      payload_on: ""
+      payload_off: ""
+      state_on: "True"
+      state_off: "False"
+
+# ---------------------------------------------------------------------------
+# Automations
+# ---------------------------------------------------------------------------
+automation:
+  # Ordinary announcement. speak-server's own quiet hours decide whether this is
+  # heard now, held until morning, or dropped — so there is no need to duplicate
+  # a time condition here.
+  - alias: Say when the washing machine finishes
+    trigger:
+      - platform: state
+        entity_id: sensor.washing_machine_status
+        to: "finished"
+    action:
+      - service: notify.speakers
+        data:
+          message: The washing machine has finished.
+
+  # Priority chosen per event rather than per service, by publishing to the
+  # priority topic directly.
+  - alias: Announce the doorbell
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.doorbell
+        to: "on"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: speak/say/high
+          payload: Somebody is at the front door.
+
+  # The full JSON body is accepted too, for anything the plain-text form can't
+  # express — a specific room, a lower volume, a particular voice.
+  - alias: Bedtime reminder in the bedroom only
+    trigger:
+      - platform: time
+        at: "22:30:00"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: speak/say
+          payload: >-
+            {"text": "It is half past ten.",
+             "priority": "low",
+             "sink": "bedroom",
+             "volume": 40}
+
+  # Genuine alarm: emergency is the one level that overrides quiet hours and the
+  # rate limit, and interrupts whatever is being spoken. Keep it for this.
+  - alias: Water leak
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.utility_room_leak
+        to: "on"
+    action:
+      - service: notify.speakers_urgent
+        data:
+          message: Water detected in the utility room.
+
+  # Stop everything when the house goes to sleep. `stop` clears the queue as well
+  # as ending what is playing; use speak/cmd/skip to end only the current one.
+  - alias: Silence the speakers at bedtime
+    trigger:
+      - platform: state
+        entity_id: input_boolean.goodnight
+        to: "on"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: speak/cmd/stop
+          payload: ""
