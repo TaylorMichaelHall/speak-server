@@ -1,6 +1,14 @@
 # Local env for UID/GID or other machine-specific interpolation
 .env
 
+__pycache__/
+
 # Supertonic model assets (~400 MB) — bind-mounted into the container, too
 # large for git. See README for seeding.
 supertonic/models/
+
+# Runtime state: voice cache, history database, replay clips, and the local
+# webhooks.json. The directory itself is tracked (see data/.gitkeep) so the
+# bind mount lands on a directory owned by whoever cloned the repo.
+data/*
+!data/.gitkeep

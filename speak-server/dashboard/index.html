@@ -1,0 +1,1051 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>speak-server</title>
+<style>
+/* ------------------------------------------------------------------------
+   A playout rundown, not a metrics dashboard.
+
+   This machine talks out loud, in priority order, and interrupts itself when
+   something urgent arrives — which is exactly what a radio playout system does.
+   So the page is built like one: an on-air slab for what is being said right
+   now, a cue list of what is next, and a log of what was already said.
+
+   Two typefaces doing two different jobs: everything the machine reports is
+   monospaced telemetry, and every sentence the machine *speaks* is set in a
+   serif at reading size, because those are words meant for a person's ear.
+   ------------------------------------------------------------------------ */
+:root {
+  --ground: #121a1c;
+  --panel: #1a2429;
+  --panel-2: #161e22;
+  --rule: #293940;
+  --ink: #e2eae9;
+  --dim: #87999c;
+  --dimmer: #5d6e72;
+
+  --onair: #f0a03c;
+  --p-emergency: #df4f47;
+  --p-high: #f0a03c;
+  --p-normal: #63aec2;
+  --p-low: #6d8286;
+  --good: #79bfa1;
+  --bad: #df4f47;
+
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --ui: system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
+  --speech: ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+
+  --gutter: clamp(16px, 4vw, 40px);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --ground: #eceae4;
+    --panel: #f7f6f2;
+    --panel-2: #e4e2db;
+    --rule: #cdcac1;
+    --ink: #1d2426;
+    --dim: #5f6b6d;
+    --dimmer: #8a9496;
+    --onair: #a8620a;
+    --p-emergency: #b1332c;
+    --p-high: #a8620a;
+    --p-normal: #276b7f;
+    --p-low: #6d8286;
+    --good: #2c6e51;
+    --bad: #b1332c;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--ui);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+
+:focus-visible {
+  outline: 2px solid var(--onair);
+  outline-offset: 2px;
+}
+
+/* --- shared atoms ------------------------------------------------------ */
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.mono { font-family: var(--mono); font-size: 12.5px; }
+
+.btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: transparent;
+  color: var(--dim);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 7px 12px;
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.btn:hover:not(:disabled) { color: var(--ink); border-color: var(--dim); }
+.btn:disabled { opacity: .4; cursor: default; }
+.btn.is-on { color: var(--ground); background: var(--onair); border-color: var(--onair); }
+.btn.is-danger:hover:not(:disabled) { color: var(--bad); border-color: var(--bad); }
+
+.icon-btn {
+  background: none; border: 0; padding: 4px 6px; cursor: pointer;
+  color: var(--dimmer); border-radius: 2px; line-height: 1;
+}
+.icon-btn:hover { color: var(--ink); }
+
+/* --- header ------------------------------------------------------------ */
+
+.masthead {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+  padding: 14px var(--gutter);
+  background: color-mix(in srgb, var(--ground) 92%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--rule);
+}
+
+.wordmark {
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  margin: 0;
+  font-weight: 500;
+}
+.wordmark span { color: var(--dimmer); }
+
+/* The lamp is the one thing you should be able to read from across the room. */
+.lamp {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--dimmer);
+}
+.lamp::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--dimmer);
+}
+.lamp[data-state="speaking"] { color: var(--onair); }
+.lamp[data-state="speaking"]::before { background: var(--onair); animation: pulse 1.6s ease-in-out infinite; }
+.lamp[data-state="muted"] { color: var(--dim); }
+.lamp[data-state="muted"]::before { background: transparent; box-shadow: inset 0 0 0 1px var(--dim); }
+.lamp[data-state="quiet"] { color: var(--p-normal); }
+.lamp[data-state="quiet"]::before { background: var(--p-normal); }
+
+@keyframes pulse { 50% { opacity: .35; } }
+
+.transport { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+
+.whoami { font-family: var(--mono); font-size: 11px; color: var(--dimmer); }
+
+/* --- layout ------------------------------------------------------------ */
+
+main { padding: 0 var(--gutter) 80px; max-width: 1180px; margin: 0 auto; }
+
+section { border-bottom: 1px solid var(--rule); padding: 26px 0; }
+section:last-of-type { border-bottom: 0; }
+
+.section-head {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.section-head .count { font-family: var(--mono); font-size: 11px; color: var(--dimmer); }
+.section-head .spacer { flex: 1; }
+
+/* --- the on-air slab: the signature element --------------------------- */
+
+.onair {
+  position: relative;
+  border-left: 3px solid var(--rule);
+  padding: 18px 0 18px 20px;
+  min-height: 132px;
+}
+.onair[data-live="true"] { border-left-color: var(--onair); }
+
+.onair-meta {
+  display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline;
+  font-family: var(--mono); font-size: 11.5px; color: var(--dim);
+}
+.onair-clock { color: var(--onair); font-variant-numeric: tabular-nums; }
+
+.utterance {
+  font-family: var(--speech);
+  font-size: clamp(21px, 3.1vw, 33px);
+  line-height: 1.28;
+  letter-spacing: -0.01em;
+  margin: 12px 0 16px;
+  max-width: 34ch;
+}
+.utterance.is-idle {
+  font-family: var(--ui);
+  font-size: 15px;
+  color: var(--dim);
+  max-width: 46ch;
+}
+
+/* An honest position line: elapsed against the clip's real decoded length,
+   not a decorative level meter. */
+.position { height: 2px; background: var(--rule); overflow: hidden; }
+.position span {
+  display: block; height: 100%; width: 0; background: var(--onair);
+  transition: width .25s linear;
+}
+.position[hidden] { display: none; }
+
+/* --- cue list (next up) ----------------------------------------------- */
+
+.cue { list-style: none; margin: 0; padding: 0; }
+
+.cue li {
+  display: grid;
+  grid-template-columns: 58px 92px 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 11px 0 11px 12px;
+  border-top: 1px solid var(--rule);
+  border-left: 3px solid var(--rule);
+}
+.cue li:last-child { border-bottom: 1px solid var(--rule); }
+.cue li[data-priority="emergency"] { border-left-color: var(--p-emergency); }
+.cue li[data-priority="high"]      { border-left-color: var(--p-high); }
+.cue li[data-priority="normal"]    { border-left-color: var(--p-normal); }
+.cue li[data-priority="low"]       { border-left-color: var(--p-low); }
+
+.cue .rank {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--dim);
+}
+.cue .waited { font-family: var(--mono); font-size: 11.5px; color: var(--dimmer); font-variant-numeric: tabular-nums; }
+.cue .line {
+  font-family: var(--speech); font-size: 16px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cue .held { color: var(--p-normal); font-family: var(--mono); font-size: 11px; }
+
+/* --- status cards ------------------------------------------------------ */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(248px, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+}
+.card { background: var(--panel); padding: 16px 18px; }
+.card h3 { margin: 0 0 12px; font: inherit; }
+.card dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; }
+.card dt { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.card dd { margin: 0; font-family: var(--mono); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+.card dd.good { color: var(--good); }
+.card dd.bad { color: var(--bad); }
+.card dd.warn { color: var(--onair); }
+.card .note { font-size: 12px; color: var(--dim); margin: 12px 0 0; }
+.card .card-actions { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* --- history log ------------------------------------------------------ */
+
+.filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.filters input, .filters select {
+  background: var(--panel-2); border: 1px solid var(--rule); color: var(--ink);
+  border-radius: 2px; padding: 6px 9px; font-family: var(--mono); font-size: 12px;
+}
+.filters input { min-width: 168px; }
+
+.log { list-style: none; margin: 0; padding: 0; }
+.log li {
+  display: grid;
+  grid-template-columns: 74px 74px 1fr auto;
+  gap: 14px; align-items: baseline;
+  padding: 10px 0;
+  border-top: 1px solid var(--rule);
+}
+.log li:last-child { border-bottom: 1px solid var(--rule); }
+.log .when { font-family: var(--mono); font-size: 11.5px; color: var(--dimmer); font-variant-numeric: tabular-nums; }
+.log .verdict { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; }
+.log .verdict[data-status="spoke"] { color: var(--good); }
+.log .verdict[data-status="failed"] { color: var(--bad); }
+.log .verdict[data-status="dropped"],
+.log .verdict[data-status="expired"],
+.log .verdict[data-status="cancelled"],
+.log .verdict[data-status="muted"],
+.log .verdict[data-status="interrupted"] { color: var(--dim); }
+.log .said { font-family: var(--speech); font-size: 15.5px; min-width: 0; }
+.log .said .detail { display: block; font-family: var(--mono); font-size: 11px; color: var(--dimmer); margin-top: 3px; }
+.log .said .fault { display: block; font-family: var(--mono); font-size: 11px; color: var(--bad); margin-top: 3px; }
+.log .row-actions { display: flex; gap: 2px; }
+
+.empty {
+  font-size: 14px; color: var(--dim);
+  border: 1px dashed var(--rule); padding: 18px 20px;
+}
+.empty b { color: var(--ink); font-weight: 500; }
+
+/* --- composer --------------------------------------------------------- */
+
+.composer { display: grid; gap: 10px; }
+.composer textarea {
+  background: var(--panel-2); border: 1px solid var(--rule); color: var(--ink);
+  border-radius: 2px; padding: 12px 14px; resize: vertical; min-height: 76px;
+  font-family: var(--speech); font-size: 17px; line-height: 1.4;
+}
+.composer .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.composer select {
+  background: var(--panel-2); border: 1px solid var(--rule); color: var(--ink);
+  border-radius: 2px; padding: 7px 9px; font-family: var(--mono); font-size: 12px;
+}
+
+/* --- toast ------------------------------------------------------------ */
+
+#toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 14px);
+  background: var(--panel); border: 1px solid var(--rule); border-left: 3px solid var(--onair);
+  padding: 11px 18px; font-family: var(--mono); font-size: 12px;
+  opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s;
+  max-width: min(560px, calc(100vw - 32px)); z-index: 40;
+}
+#toast.show { opacity: 1; transform: translate(-50%, 0); }
+#toast.bad { border-left-color: var(--bad); }
+
+@media (max-width: 620px) {
+  .cue li { grid-template-columns: 52px 1fr auto; }
+  .cue .waited { display: none; }
+  .log li { grid-template-columns: 62px 1fr auto; }
+  .log .verdict { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <h1 class="wordmark">speak<span>-server</span></h1>
+  <span class="lamp" id="lamp" data-state="idle">silent</span>
+  <div class="transport">
+    <button class="btn" id="btn-mute">Mute</button>
+    <button class="btn" id="btn-skip">Skip</button>
+    <button class="btn is-danger" id="btn-stop">Stop everything</button>
+  </div>
+  <span class="whoami" id="whoami"></span>
+</header>
+
+<main>
+  <section aria-labelledby="h-now">
+    <div class="section-head">
+      <span class="eyebrow" id="h-now">Now speaking</span>
+      <span class="spacer"></span>
+      <span class="mono" id="now-id" style="color:var(--dimmer)"></span>
+    </div>
+    <div class="onair" id="onair" data-live="false">
+      <div class="onair-meta" id="now-meta"></div>
+      <p class="utterance is-idle" id="now-text">Nothing is being spoken. Anything sent to <code>/speak</code> shows up here.</p>
+      <div class="position" id="position" hidden><span id="position-fill"></span></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-next">
+    <div class="section-head">
+      <span class="eyebrow" id="h-next">Next up</span>
+      <span class="count" id="next-count"></span>
+      <span class="spacer"></span>
+      <button class="btn" id="btn-clear">Clear queue</button>
+    </div>
+    <ul class="cue" id="cue"></ul>
+    <p class="empty" id="cue-empty" hidden><b>Nothing waiting.</b> Queued speech appears here in priority order, newest last.</p>
+  </section>
+
+  <section aria-labelledby="h-say">
+    <div class="section-head"><span class="eyebrow" id="h-say">Say something</span></div>
+    <form class="composer" id="composer">
+      <textarea id="say-text" placeholder="Type what the machine should say out loud." rows="2"></textarea>
+      <div class="controls">
+        <select id="say-engine" aria-label="Engine"></select>
+        <select id="say-voice" aria-label="Voice"></select>
+        <select id="say-priority" aria-label="Priority"></select>
+        <select id="say-sink" aria-label="Output"></select>
+        <button class="btn is-on" type="submit" id="btn-say">Speak it</button>
+      </div>
+    </form>
+  </section>
+
+  <section aria-labelledby="h-state">
+    <div class="section-head"><span class="eyebrow" id="h-state">Machine state</span></div>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section aria-labelledby="h-log">
+    <div class="section-head">
+      <span class="eyebrow" id="h-log">Said earlier</span>
+      <span class="count" id="log-count"></span>
+      <span class="spacer"></span>
+      <div class="filters">
+        <input type="search" id="log-search" placeholder="Search what was said" aria-label="Search history">
+        <select id="log-status" aria-label="Filter by outcome">
+          <option value="">Every outcome</option>
+          <option value="spoke">Spoken</option>
+          <option value="failed">Failed</option>
+          <option value="dropped">Dropped</option>
+          <option value="interrupted">Interrupted</option>
+          <option value="expired">Expired</option>
+          <option value="cancelled">Cancelled</option>
+          <option value="muted">Muted</option>
+        </select>
+      </div>
+    </div>
+    <ul class="log" id="log"></ul>
+    <p class="empty" id="log-empty" hidden><b>Nothing recorded yet.</b> Every utterance lands here once it finishes, with the audio kept for replay.</p>
+  </section>
+</main>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<audio id="player" hidden></audio>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------------------
+   One poll drives everything. /api/status already carries the queue snapshot,
+   so the live view needs a single request; history is fetched on its own,
+   slower cadence and whenever the operator changes a filter or acts on a row.
+   --------------------------------------------------------------------------- */
+
+const POLL_MS = 2000;
+const HISTORY_MS = 6000;
+const PRIORITY_CODE = { emergency: "EMRG", high: "HIGH", normal: "NORM", low: "LOW" };
+
+const el = (id) => document.getElementById(id);
+const state = {
+  status: null,
+  voices: {},
+  // Local clock for the position line: the server tells us where playback was
+  // at poll time, and we advance from there so the line moves smoothly instead
+  // of jumping every two seconds.
+  nowStartedAt: null,
+  nowId: null,
+  nowDuration: null,
+};
+
+/* --- fetch helpers ---------------------------------------------------- */
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    headers: { Accept: "application/json", ...(options.headers || {}) },
+    ...options,
+  });
+  const text = await response.text();
+  let payload = null;
+  try { payload = text ? JSON.parse(text) : null; } catch { payload = { message: text.trim() }; }
+  if (!response.ok) {
+    const detail = (payload && (payload.message || payload.error)) || response.statusText;
+    throw new Error(detail || `HTTP ${response.status}`);
+  }
+  return payload;
+}
+
+async function act(path, options, successMessage) {
+  try {
+    const result = await api(path, { method: "POST", ...options });
+    toast(successMessage || (result && result.message) || "Done");
+    await Promise.all([refresh(), loadHistory()]);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+let toastTimer = null;
+function toast(message, isBad = false) {
+  const node = el("toast");
+  node.textContent = message;
+  node.classList.toggle("bad", Boolean(isBad));
+  node.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => node.classList.remove("show"), 4200);
+}
+
+/* --- formatting ------------------------------------------------------- */
+
+const pad = (n) => String(n).padStart(2, "0");
+
+function clock(ms) {
+  if (ms == null) return "–";
+  const total = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(total / 60)}:${pad(total % 60)}`;
+}
+
+function ago(seconds) {
+  if (!seconds) return "–";
+  const delta = Math.max(0, Date.now() / 1000 - seconds);
+  if (delta < 60) return `${Math.round(delta)}s ago`;
+  if (delta < 3600) return `${Math.round(delta / 60)}m ago`;
+  if (delta < 86400) return `${Math.round(delta / 3600)}h ago`;
+  return `${Math.round(delta / 86400)}d ago`;
+}
+
+function timeOfDay(seconds) {
+  if (!seconds) return "–";
+  const date = new Date(seconds * 1000);
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function bytes(value) {
+  if (!value) return "0";
+  const units = ["B", "kB", "MB", "GB"];
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[index]}`;
+}
+
+function ms(value) {
+  if (value == null) return "–";
+  return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} s`;
+}
+
+/* --- the on-air slab -------------------------------------------------- */
+
+function renderNow(snapshot) {
+  const playing = snapshot.playing;
+  const slab = el("onair");
+  const textNode = el("now-text");
+  const metaNode = el("now-meta");
+  const position = el("position");
+
+  if (!playing) {
+    slab.dataset.live = "false";
+    textNode.className = "utterance is-idle";
+    textNode.textContent = snapshot.muted
+      ? "Playback is muted. Anything sent now is dropped rather than held."
+      : "Nothing is being spoken. Anything sent to /speak shows up here.";
+    metaNode.textContent = "";
+    el("now-id").textContent = "";
+    position.hidden = true;
+    state.nowId = null;
+    return;
+  }
+
+  slab.dataset.live = "true";
+  textNode.className = "utterance";
+  textNode.textContent = playing.text;
+  el("now-id").textContent = playing.id;
+
+  const bits = [
+    PRIORITY_CODE[playing.priority] || playing.priority,
+    playing.engine_used || playing.engine,
+    playing.voice || "default voice",
+    playing.cache_hit ? "cached" : `synth ${ms(playing.synth_ms)}`,
+  ];
+  if (playing.sink) bits.push(playing.sink);
+  if (playing.source && playing.source !== "http") bits.push(playing.source);
+
+  metaNode.innerHTML = "";
+  const clockSpan = document.createElement("span");
+  clockSpan.className = "onair-clock";
+  clockSpan.id = "now-elapsed";
+  metaNode.appendChild(clockSpan);
+  bits.forEach((bit) => {
+    const span = document.createElement("span");
+    span.textContent = bit;
+    metaNode.appendChild(span);
+  });
+
+  // Re-anchor the local clock only when the utterance changes, so the line
+  // doesn't stutter backwards on each poll.
+  if (state.nowId !== playing.id) {
+    state.nowId = playing.id;
+    state.nowDuration = playing.audio_ms || null;
+    state.nowStartedAt = Date.now() - (playing.playing_for_ms || 0);
+  }
+  position.hidden = !state.nowDuration;
+  tickPosition();
+}
+
+function tickPosition() {
+  if (!state.nowId || !state.nowStartedAt) return;
+  const elapsed = Date.now() - state.nowStartedAt;
+  const elapsedNode = el("now-elapsed");
+  if (elapsedNode) {
+    elapsedNode.textContent = state.nowDuration
+      ? `${clock(elapsed)} / ${clock(state.nowDuration)}`
+      : clock(elapsed);
+  }
+  if (state.nowDuration) {
+    const fraction = Math.min(1, elapsed / state.nowDuration);
+    el("position-fill").style.width = `${(fraction * 100).toFixed(1)}%`;
+  }
+}
+
+/* --- cue list --------------------------------------------------------- */
+
+function renderCue(snapshot) {
+  const list = el("cue");
+  const waiting = snapshot.waiting || [];
+  el("next-count").textContent = waiting.length
+    ? `${waiting.length} of ${snapshot.max_depth}`
+    : "";
+  el("cue-empty").hidden = waiting.length > 0;
+  el("btn-clear").disabled = waiting.length === 0;
+  list.innerHTML = "";
+
+  waiting.forEach((item) => {
+    const row = document.createElement("li");
+    row.dataset.priority = item.priority;
+
+    const rank = document.createElement("span");
+    rank.className = "rank";
+    rank.textContent = PRIORITY_CODE[item.priority] || item.priority;
+
+    const waited = document.createElement("span");
+    waited.className = "waited";
+    if (item.not_before) {
+      waited.classList.add("held");
+      waited.textContent = `held → ${timeOfDay(item.not_before)}`;
+    } else {
+      waited.textContent = `${clock((Date.now() / 1000 - item.created_at) * 1000)} waited`;
+    }
+
+    const line = document.createElement("span");
+    line.className = "line";
+    line.textContent = item.text;
+    line.title = item.text;
+
+    const actions = document.createElement("span");
+    actions.className = "row-actions";
+    const drop = document.createElement("button");
+    drop.className = "icon-btn";
+    drop.type = "button";
+    drop.title = "Remove from the queue";
+    drop.setAttribute("aria-label", `Remove: ${item.text.slice(0, 60)}`);
+    drop.textContent = "✕";
+    drop.addEventListener("click", () => act(`/api/queue/${item.id}`, { method: "DELETE" }, "Removed"));
+    actions.appendChild(drop);
+
+    row.append(rank, waited, line, actions);
+    list.appendChild(row);
+  });
+}
+
+/* --- status cards ----------------------------------------------------- */
+
+function card(title, rows, extra) {
+  const node = document.createElement("div");
+  node.className = "card";
+  const heading = document.createElement("h3");
+  heading.className = "eyebrow";
+  heading.textContent = title;
+  node.appendChild(heading);
+
+  const list = document.createElement("dl");
+  rows.forEach(([label, value, tone]) => {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (tone) dd.className = tone;
+    list.append(dt, dd);
+  });
+  node.appendChild(list);
+  if (extra) node.appendChild(extra);
+  return node;
+}
+
+function renderCards(status) {
+  const wrap = el("cards");
+  wrap.innerHTML = "";
+
+  // Engines: latency is measured, so say so — a configured number would be a lie.
+  const engineRows = Object.entries(status.engines || {}).map(([name, info]) => {
+    if (info.cooling_down) {
+      return [name, `resting ${info.cooldown_remaining}s`, "bad"];
+    }
+    if (info.latency_ms == null) {
+      return [name, info.failures ? `${info.failures} failed` : "not measured", info.failures ? "warn" : null];
+    }
+    return [name, `${ms(info.latency_ms)} · ${info.samples} runs`, "good"];
+  });
+  const engineNote = document.createElement("p");
+  engineNote.className = "note";
+  engineNote.textContent = `Default engine: ${status.config.default_engine}. `
+    + `"fastest" picks by these measured times.`;
+  wrap.appendChild(card("Engines", engineRows.length ? engineRows : [["configured", "none"]], engineNote));
+
+  // Quiet hours
+  const quiet = status.quiet_hours || {};
+  const quietRows = [];
+  if (quiet.configured) {
+    quietRows.push(["windows", quiet.windows.join(", ")]);
+    quietRows.push(["local time", `${quiet.local_time} ${quiet.timezone}`]);
+    quietRows.push(["right now", quiet.snoozed ? "snoozed" : (quiet.active ? "quiet" : "open"),
+                    quiet.snoozed ? "warn" : (quiet.active ? "warn" : "good")]);
+    quietRows.push([`${quiet.policy} below`, quiet.override_priority]);
+    if (quiet.active && quiet.ends_at) quietRows.push(["opens at", timeOfDay(quiet.ends_at)]);
+  } else {
+    quietRows.push(["windows", "none set"]);
+  }
+  const quietActions = document.createElement("div");
+  quietActions.className = "card-actions";
+  if (quiet.configured) {
+    const snooze = document.createElement("button");
+    snooze.className = "btn";
+    snooze.type = "button";
+    snooze.textContent = quiet.snoozed ? "End snooze" : "Snooze 1 hour";
+    snooze.addEventListener("click", () => (quiet.snoozed
+      ? act("/api/quiet/resume", {}, "Quiet hours back on")
+      : act("/api/quiet/snooze?seconds=3600", {}, "Quiet hours snoozed for an hour")));
+    quietActions.appendChild(snooze);
+  }
+  wrap.appendChild(card("Quiet hours", quietRows, quiet.configured ? quietActions : null));
+
+  // Cache
+  const cache = status.cache || {};
+  const cacheRows = cache.enabled ? [
+    ["clips kept", String(cache.entries)],
+    ["on disk", `${bytes(cache.bytes)} / ${cache.max_mb} MB`],
+    ["reused", cache.hit_rate == null ? "no lookups yet" : `${Math.round(cache.hit_rate * 100)}%`,
+     cache.hit_rate > 0.3 ? "good" : null],
+    ["evicted", String(cache.evictions)],
+  ] : [["state", "off", "warn"]];
+  const cacheActions = document.createElement("div");
+  cacheActions.className = "card-actions";
+  if (cache.enabled) {
+    const clear = document.createElement("button");
+    clear.className = "btn";
+    clear.type = "button";
+    clear.textContent = "Empty the cache";
+    clear.addEventListener("click", () => act("/api/cache/clear", {}, "Cache emptied"));
+    cacheActions.appendChild(clear);
+  }
+  wrap.appendChild(card("Voice cache", cacheRows, cache.enabled ? cacheActions : null));
+
+  // Output routing
+  const audio = status.audio || {};
+  const audioRows = [
+    ["playing through", audio.configured_sink || audio.default_sink || "session default"],
+    ["volume", `${audio.volume}%`],
+    ["lead silence", `${audio.lead_silence_ms} ms`],
+    ["muted", audio.muted ? "yes" : "no", audio.muted ? "warn" : "good"],
+  ];
+  const routeNames = Object.keys(audio.routes || {});
+  if (routeNames.length) audioRows.push(["named outputs", routeNames.join(", ")]);
+  wrap.appendChild(card("Output", audioRows));
+
+  // Access
+  const access = status.auth || {};
+  const accessRows = [
+    ["tokens", access.auth_required ? access.tokens.join(", ") || "none" : "not required",
+     access.auth_required ? "good" : "warn"],
+    ["rate limit", access.rate_limit || "off"],
+  ];
+  const remaining = Object.entries(access.remaining || {});
+  remaining.slice(0, 4).forEach(([who, left]) => accessRows.push([`${who} left`, String(Math.floor(left))]));
+  const accessNote = document.createElement("p");
+  accessNote.className = "note";
+  accessNote.textContent = access.auth_required
+    ? `Exempt without a token: ${access.exempt_networks.join(", ") || "nothing"}.`
+    : "No tokens are set, so anyone who can reach this port can make the machine talk.";
+  wrap.appendChild(card("Access", accessRows, accessNote));
+
+  // Connections: MQTT and webhooks, both optional
+  const mqtt = status.mqtt || {};
+  const hooks = (status.webhooks && status.webhooks.receivers) || [];
+  const connRows = [
+    ["mqtt", mqtt.configured ? (mqtt.connected ? `connected to ${mqtt.host}` : (mqtt.reason || "not connected")) : "not set up",
+     mqtt.configured ? (mqtt.connected ? "good" : "bad") : null],
+    ["webhooks", hooks.length ? hooks.map((h) => h.name).join(", ") : "none defined"],
+    ["spoken today", String((status.history && status.history.last_24h) || 0)],
+  ];
+  wrap.appendChild(card("Ways in", connRows));
+}
+
+/* --- history log ------------------------------------------------------ */
+
+async function loadHistory() {
+  const search = el("log-search").value.trim();
+  const status = el("log-status").value;
+  const params = new URLSearchParams({ limit: "60" });
+  if (search) params.set("q", search);
+  if (status) params.set("status", status);
+
+  let payload;
+  try {
+    payload = await api(`/api/history?${params}`);
+  } catch (error) {
+    toast(`Could not load history: ${error.message}`, true);
+    return;
+  }
+
+  const rows = payload.rows || [];
+  const list = el("log");
+  el("log-empty").hidden = rows.length > 0;
+  el("log-count").textContent = payload.stats && payload.stats.rows
+    ? `${rows.length} of ${payload.stats.rows} kept`
+    : "";
+  list.innerHTML = "";
+
+  rows.forEach((row) => {
+    const item = document.createElement("li");
+
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = timeOfDay(row.created_at);
+    when.title = new Date(row.created_at * 1000).toLocaleString();
+
+    const verdict = document.createElement("span");
+    verdict.className = "verdict";
+    verdict.dataset.status = row.status;
+    verdict.textContent = row.status;
+
+    const said = document.createElement("span");
+    said.className = "said";
+    said.textContent = row.text;
+    const detail = document.createElement("span");
+    detail.className = "detail";
+    const parts = [
+      row.engine_used || row.engine,
+      row.voice || "default voice",
+      row.cache_hit ? "cached" : `synth ${ms(row.synth_ms)}`,
+      `heard ${ms(row.audio_ms)}`,
+    ];
+    if (row.client) parts.push(row.client);
+    if (row.source && row.source !== "http") parts.push(row.source);
+    detail.textContent = parts.join(" · ");
+    said.appendChild(detail);
+    if (row.error) {
+      const fault = document.createElement("span");
+      fault.className = "fault";
+      fault.textContent = row.error;
+      said.appendChild(fault);
+    }
+
+    const actions = document.createElement("span");
+    actions.className = "row-actions";
+    if (row.has_audio) {
+      const listen = document.createElement("button");
+      listen.className = "icon-btn";
+      listen.type = "button";
+      listen.title = "Play the recording";
+      listen.setAttribute("aria-label", "Play the recording");
+      listen.textContent = "▶";
+      listen.addEventListener("click", () => {
+        const player = el("player");
+        player.src = `/api/history/${row.id}/audio`;
+        player.play().catch((error) => toast(`Cannot play that clip: ${error.message}`, true));
+      });
+      actions.appendChild(listen);
+    }
+    const again = document.createElement("button");
+    again.className = "icon-btn";
+    again.type = "button";
+    again.title = "Say it again on the speakers";
+    again.setAttribute("aria-label", "Say it again on the speakers");
+    again.textContent = "↺";
+    again.addEventListener("click", () => act(`/api/history/${row.id}/replay`, {}, "Queued to say again"));
+    actions.appendChild(again);
+
+    item.append(when, verdict, said, actions);
+    list.appendChild(item);
+  });
+}
+
+/* --- composer --------------------------------------------------------- */
+
+function fillOptions(select, values, selected) {
+  select.innerHTML = "";
+  values.forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    if (value === selected) option.selected = true;
+    select.appendChild(option);
+  });
+}
+
+async function setupComposer(status) {
+  const engineNames = Object.keys(status.config.engines || {});
+  fillOptions(
+    el("say-engine"),
+    [...engineNames.map((n) => [n, n]), ["fastest", "fastest"], ["random", "random"]],
+    status.config.default_engine
+  );
+  fillOptions(
+    el("say-priority"),
+    Object.keys(status.config.priorities).map((n) => [n, n]),
+    status.config.default_priority
+  );
+
+  const routes = Object.keys(status.audio.routes || {});
+  fillOptions(el("say-sink"), [["", "default output"], ...routes.map((r) => [r, r])], "");
+
+  await refreshVoices();
+}
+
+async function refreshVoices() {
+  const engine = el("say-engine").value;
+  const select = el("say-voice");
+  if (!state.status || !state.status.config.engines[engine]) {
+    // "fastest"/"random" pick the engine at speak time, so a voice chosen here
+    // could not be honoured — say that rather than offering a list that lies.
+    fillOptions(select, [["", "each engine's own voice"]], "");
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  if (!state.voices[engine]) {
+    try {
+      const payload = await api(`/api/voices/${engine}`);
+      state.voices[engine] = payload.voices[engine] || [];
+    } catch {
+      state.voices[engine] = [];
+    }
+  }
+  const fallback = state.status.config.engines[engine].voice;
+  fillOptions(
+    select,
+    [["", `${fallback} (default)`], ...state.voices[engine].filter((v) => v !== fallback).map((v) => [v, v])],
+    ""
+  );
+}
+
+/* --- polling ---------------------------------------------------------- */
+
+let firstLoad = true;
+
+async function refresh() {
+  let status;
+  try {
+    status = await api("/api/status");
+  } catch (error) {
+    el("lamp").dataset.state = "idle";
+    el("lamp").textContent = "unreachable";
+    if (firstLoad) toast(`Cannot reach the server: ${error.message}`, true);
+    return;
+  }
+  state.status = status;
+
+  const snapshot = status.queue;
+  const lamp = el("lamp");
+  if (snapshot.playing) {
+    lamp.dataset.state = "speaking";
+    lamp.textContent = "speaking";
+  } else if (snapshot.muted) {
+    lamp.dataset.state = "muted";
+    lamp.textContent = "muted";
+  } else if (status.quiet_hours.active) {
+    lamp.dataset.state = "quiet";
+    lamp.textContent = "quiet hours";
+  } else {
+    lamp.dataset.state = "idle";
+    lamp.textContent = "silent";
+  }
+
+  el("btn-mute").textContent = snapshot.muted ? "Unmute" : "Mute";
+  el("btn-mute").classList.toggle("is-on", snapshot.muted);
+  el("btn-skip").disabled = !snapshot.playing;
+  el("whoami").textContent = status.identity.authenticated
+    ? `signed in as ${status.identity.name}`
+    : `${status.identity.name} · no token`;
+
+  renderNow(snapshot);
+  renderCue(snapshot);
+  renderCards(status);
+
+  if (firstLoad) {
+    firstLoad = false;
+    await setupComposer(status);
+  }
+}
+
+/* --- wiring ----------------------------------------------------------- */
+
+el("btn-mute").addEventListener("click", () => {
+  const muted = state.status && state.status.queue.muted;
+  act("/api/mute", {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ muted: !muted }),
+  }, muted ? "Unmuted" : "Muted");
+});
+el("btn-skip").addEventListener("click", () => act("/api/skip", {}, "Skipped"));
+el("btn-stop").addEventListener("click", () => act("/api/stop", {}, "Stopped and cleared"));
+el("btn-clear").addEventListener("click", () => act("/api/queue/clear", {}, "Queue cleared"));
+el("say-engine").addEventListener("change", refreshVoices);
+
+el("composer").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const text = el("say-text").value.trim();
+  if (!text) { toast("Type something for it to say.", true); return; }
+  const body = {
+    text,
+    engine: el("say-engine").value,
+    priority: el("say-priority").value,
+    wait: false,
+  };
+  if (el("say-voice").value) body.voice = el("say-voice").value;
+  if (el("say-sink").value) body.sink = el("say-sink").value;
+
+  el("btn-say").disabled = true;
+  try {
+    const result = await api("/api/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    el("say-text").value = "";
+    toast(result.status === "queued" ? "Queued" : (result.message || "Sent"));
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    el("btn-say").disabled = false;
+  }
+});
+
+let searchTimer = null;
+el("log-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(loadHistory, 280);
+});
+el("log-status").addEventListener("change", loadHistory);
+
+// Space toggles mute, like a talkback key — but never while typing.
+document.addEventListener("keydown", (event) => {
+  if (event.target.matches("input, textarea, select")) return;
+  if (event.key === "m") { el("btn-mute").click(); event.preventDefault(); }
+  if (event.key === "s") { el("btn-skip").click(); event.preventDefault(); }
+});
+
+// A token passed in the URL has already been swapped for a cookie by the server;
+// clean it out of the address bar so it isn't shared by copy-paste.
+if (location.search.includes("token=")) {
+  history.replaceState(null, "", location.pathname);
+}
+
+refresh();
+loadHistory();
+setInterval(refresh, POLL_MS);
+setInterval(loadHistory, HISTORY_MS);
+setInterval(tickPosition, 250);
+</script>
+</body>
+</html>

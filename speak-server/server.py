@@ -1,185 +1,142 @@
-"""Speak server: POST text -> synthesize via a TTS engine -> play on host speakers.
+"""speak-server entrypoint: POST text -> synthesize -> play on host speakers.
 
-Runs in a container with the host's Pulse socket mounted. Playback is
-serialized (single-threaded HTTPServer) so overlapping requests queue
-instead of talking over each other. Errors map to non-2xx so remote
-callers never believe they spoke when nothing played.
+Runs in a container with the host's Pulse socket mounted. Playback is serialized
+by a single player thread, so overlapping requests queue (by priority) instead of
+talking over each other. Errors map to non-2xx so remote callers never believe
+they spoke when nothing played.
+
+This module does nothing but wire the pieces together and keep the process alive:
+
+    config      environment parsing, one place, empty means unset
+    engines     the TTS backends, health and measured latency
+    cache       content-addressed audio cache
+    audio       sink routing, volume, interruptible playback
+    quiethours  time windows and what to do inside them
+    queues      priority queue and the player thread
+    history     SQLite log of what was said, and the audio to replay it
+    auth        tokens and rate limits
+    api         HTTP surface and the dashboard
+    webhooks    templated receivers for other people's JSON
+    mqtt        optional broker bridge
 """
 
-import io
-import json
+import logging
 import os
-import random
-import subprocess
-import urllib.error
-import urllib.request
-import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import signal
+import sys
+import threading
 
-KOKORO_URL = os.environ.get("KOKORO_URL", "http://kokoro:8880")
-SUPERTONIC_URL = os.environ.get("SUPERTONIC_URL", "http://supertonic:7788")
-DEFAULT_ENGINE = os.environ.get("ENGINE", "kokoro")
-DEFAULT_VOICE = os.environ.get("VOICE", "af_heart")
-SUPERTONIC_VOICE = os.environ.get("SUPERTONIC_VOICE", "M1")
-PORT = int(os.environ.get("PORT", "8899"))
+import config
 
-# Both engines speak the OpenAI /v1/audio/speech dialect, so an engine is just
-# a base URL, the model name it insists on, and the voice used when the
-# request doesn't name one (voice names are engine-specific, so a global
-# default would be wrong for one of them).
-ENGINES = {
-    "kokoro": {"url": KOKORO_URL, "model": "kokoro", "voice": DEFAULT_VOICE},
-    "supertonic": {"url": SUPERTONIC_URL, "model": "supertonic-3", "voice": SUPERTONIC_VOICE},
-}
+config.setup_logging()
+log = logging.getLogger("server")
 
+import api          # noqa: E402  - logging must be configured before these import
+import audio        # noqa: E402
+import cache        # noqa: E402
+import engines      # noqa: E402
+import mqtt         # noqa: E402
+import webhooks     # noqa: E402
+from history import history      # noqa: E402
+from queues import queue        # noqa: E402
+from quiethours import quiet_hours  # noqa: E402
 
-def synthesize(engine, text, voice, speed, lang):
-    """Ask one engine for WAV audio. Returns (wav_bytes, None) on success,
-    (None, error_string) on failure — no exceptions escape."""
-    cfg = ENGINES[engine]
-    payload = {
-        "model": cfg["model"],
-        "input": text,
-        "voice": voice if voice is not None else cfg["voice"],
-        "response_format": "wav",
-        "speed": speed,
-    }
-    # Supertonic extension ('ko', 'ja', ..., default auto-fallback 'na');
-    # only sent when given so kokoro never sees an unknown field.
-    if lang is not None:
-        payload["lang"] = lang
-
-    req = urllib.request.Request(
-        f"{cfg['url']}/v1/audio/speech",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            audio = resp.read()
-    except urllib.error.HTTPError as e:
-        return None, f"{engine} returned HTTP {e.code}: {e.read()[:300].decode(errors='replace')}"
-    except (urllib.error.URLError, OSError) as e:
-        return None, f"{engine} unreachable at {cfg['url']}: {e}"
-    if not audio:
-        return None, f"{engine} returned empty audio"
-    return audio, None
-# The audio sink suspends when idle; opening a stream spends the first few
-# hundred ms resuming, which clips the start of speech. Prepend silence so the
-# resume ramp eats that instead of the first syllable. Silent, so it's never
-# heard and never missed. Set to 0 to disable.
-LEAD_SILENCE_MS = int(os.environ.get("LEAD_SILENCE_MS", "500"))
+# Retention and bucket pruning run on a timer rather than inline: they walk
+# directories and delete rows, neither of which belongs in the path of something
+# a person is waiting to hear.
+MAINTENANCE_INTERVAL = 900
 
 
-def prepend_silence(wav_bytes, ms):
-    """Return a WAV with `ms` of leading silence. Falls back to the original
-    bytes if anything about the WAV can't be parsed — padding is a nicety, so
-    a parse failure must never stop playback."""
-    if ms <= 0:
-        return wav_bytes
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as src:
-            nchannels = src.getnchannels()
-            sampwidth = src.getsampwidth()
-            framerate = src.getframerate()
-            # kokoro returns a streaming WAV whose header carries a placeholder
-            # frame count, so read to EOF rather than trusting getnframes().
-            frames = src.readframes(-1)
-        pad_frames = int(framerate * ms / 1000)
-        silence = b"\x00" * (pad_frames * sampwidth * nchannels)
-        out = io.BytesIO()
-        with wave.open(out, "wb") as dst:
-            # Set format explicitly (not setparams) so the writer sizes the
-            # header from the bytes actually written, not the placeholder count.
-            dst.setnchannels(nchannels)
-            dst.setsampwidth(sampwidth)
-            dst.setframerate(framerate)
-            dst.writeframes(silence + frames)
-        return out.getvalue()
-    except (wave.Error, EOFError, ValueError):
-        return wav_bytes
+def maintenance_loop(stop_event):
+    """Housekeeping for a process expected to run for months unattended: keep the
+    cache and history inside their limits, and forget rate-limit buckets for
+    clients that have gone away."""
+    import auth
 
-
-class Handler(BaseHTTPRequestHandler):
-    def _reply(self, code, message):
-        body = (message.rstrip("\n") + "\n").encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path == "/health":
-            self._reply(200, "ok")
-        else:
-            self._reply(404, "not found")
-
-    def do_POST(self):
-        if self.path.split("?")[0] != "/speak":
-            self._reply(404, "not found")
-            return
-
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length).decode("utf-8", errors="replace")
-
-        # Body is plain text, or JSON
-        # {"text": ..., "engine": ..., "voice": ..., "speed": ..., "lang": ...}
-        text, engine, voice, speed, lang = raw, DEFAULT_ENGINE, None, 1.0, None
+    while not stop_event.wait(MAINTENANCE_INTERVAL):
         try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict) and "text" in parsed:
-                text = str(parsed["text"])
-                engine = str(parsed.get("engine", DEFAULT_ENGINE))
-                if "voice" in parsed:
-                    voice = str(parsed["voice"])
-                speed = float(parsed.get("speed", 1.0))
-                if "lang" in parsed:
-                    lang = str(parsed["lang"])
-        except (ValueError, TypeError):
-            pass
+            cache.audio_cache.prune()
+            history.prune()
+            if auth.limiter is not None:
+                auth.limiter.prune()
+            audio.player.cleanup_temp()
+        except Exception:
+            # A failing sweep must not end the thread; the next pass may work,
+            # and speech keeps working regardless.
+            log.exception("maintenance pass failed")
 
-        if not text.strip():
-            self._reply(400, "no text given")
-            return
 
-        # 'random' shuffles all engines and falls through to the next on
-        # failure, so a knocked-out engine (e.g. supertonic's profile turned
-        # off) costs variety, never speech. An explicitly named engine gets
-        # no fallback — the caller asked for that one, and a stand-in voice
-        # would misreport what happened.
-        if engine == "random":
-            candidates = random.sample(list(ENGINES), len(ENGINES))
-        elif engine in ENGINES:
-            candidates = [engine]
-        else:
-            self._reply(400, f"unknown engine {engine!r}; one of: {', '.join(ENGINES)}, random")
-            return
+def describe_startup():
+    log.info("engines: %s (default %s)", ", ".join(engines.ENGINES), config.DEFAULT_ENGINE)
+    quiet = quiet_hours.status()
+    log.info("quiet hours: %s", ", ".join(quiet["windows"]) or "none")
+    log.info("cache: %s, history: %s, dashboard: %s",
+             "on" if cache.audio_cache.enabled else "off",
+             "on" if history.enabled else "off",
+             "on" if config.DASHBOARD_ENABLED else "off")
+    if config.AUTH_REQUIRED:
+        log.info("auth: on, tokens: %s", ", ".join(sorted(config.SPEAK_TOKENS)))
+        log.info("auth exempt: %s", ", ".join(config.AUTH_EXEMPT_CIDRS) or "nothing")
+        if config.AUTH_EXEMPT_GATEWAY:
+            # Worth its own line: it is the difference between speak.sh working
+            # and returning 401, and it exempts more than the name suggests.
+            log.info("auth: %s is this container's gateway, so callers on the host "
+                     "(and anything else reaching the published port through it) "
+                     "skip auth; set AUTH_EXEMPT_CIDRS to override",
+                     config.AUTH_EXEMPT_GATEWAY)
+    if config.AUDIO_ROUTES:
+        log.info("audio routes: %s", ", ".join(f"{k}->{v}" for k, v in config.AUDIO_ROUTES.items()))
+    receivers = webhooks.registry.receivers
+    log.info("webhook receivers: %s", ", ".join(sorted(receivers)) or "none")
 
-        audio, errors = None, []
-        for candidate in candidates:
-            audio, err = synthesize(candidate, text, voice, speed, lang)
-            if audio is not None:
-                break
-            errors.append(err)
-        if audio is None:
-            self._reply(502, "; ".join(errors))
-            return
 
-        audio = prepend_silence(audio, LEAD_SILENCE_MS)
+def main():
+    fatal = config.validate()
+    if fatal:
+        for problem in fatal:
+            log.error("configuration error: %s", problem)
+        return 2
 
-        play = subprocess.run(
-            ["paplay", "--client-name=speak-server", "/dev/stdin"],
-            input=audio,
-            capture_output=True,
-            timeout=600,
-        )
-        if play.returncode != 0:
-            self._reply(500, f"paplay failed ({play.returncode}): {play.stderr[:300].decode(errors='replace')}")
-            return
+    try:
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+    except OSError as e:
+        # Not fatal: caching, history and the temp-file playback path all degrade
+        # on their own, and speaking is more important than any of them.
+        log.warning("cannot create %s (%s); cache and history will be disabled",
+                    config.DATA_DIR, e)
 
-        self._reply(200, "spoke")
+    describe_startup()
+    audio.player.cleanup_temp()
+
+    queue.start()
+    mqtt.bridge.start()
+
+    stop_event = threading.Event()
+    threading.Thread(target=maintenance_loop, args=(stop_event,),
+                     name="maintenance", daemon=True).start()
+
+    server = api.serve()
+
+    def shutdown(signum, _frame):
+        # Compose sends SIGTERM on `down` and on restart. Stopping the player
+        # thread first means the current clip is cut off rather than the process
+        # lingering for the length of a paragraph someone is having read out.
+        log.info("received signal %s; shutting down", signum)
+        stop_event.set()
+        queue.shutdown()
+        mqtt.bridge.stop()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    log.info("stopped")
+    return 0
 
 
 if __name__ == "__main__":
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    sys.exit(main())
